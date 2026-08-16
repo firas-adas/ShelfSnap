@@ -13,7 +13,7 @@ from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
 from werkzeug.utils import secure_filename
-from openai import OpenAI
+import anthropic
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas as pdf_canvas
@@ -134,65 +134,176 @@ class PriceHistory(db.Model):
 
 INVOICE_PARSE_PROMPT = """You are an expert invoice parser for wholesale distributors that supply gas stations and convenience stores. You can read ANY invoice format from ANY distributor.
 
-YOUR TASK: Analyze this invoice image, figure out its structure, and extract every line item with correct retail unit counts.
+TASK: Look at ALL invoice page images provided. They may be separate pages of the same invoice, or different invoices entirely. Extract every line item across all pages. If pages overlap (show same items), deduplicate them.
 
-STEP 1 - UNDERSTAND THE INVOICE LAYOUT:
-- First, identify the column headers. Different distributors use different column names and layouts.
-- Find the columns for: item description, quantity ordered, cost/price, total amount, and UPC if present.
-- The "total" or "amount" or "ext price" column (usually the rightmost dollar column) is the total cost for that line.
+=== STEP 1: IDENTIFY THE INVOICE FORMAT ===
 
-STEP 2 - FIGURE OUT RETAIL UNITS PER LINE:
-This is the most important step. For each line item, determine: "If a store owner buys this case, how many individual items does he put on the shelf to sell, and what IS each item?"
+Read the column headers carefully. Common distributor formats:
 
-Think about it like this:
-- A "case" from the distributor contains multiple retail units.
-- A retail unit is what a customer picks up and brings to the register.
-- Sometimes the retail unit is a single item (one can of soda, one bag of chips, one candy bar).
-- Sometimes the retail unit is a multi-pack (a 6-pack of beer, a 12-pack of soda, a 3-pack of lighters).
+FORMAT A - "DET / Home Juice style" (Price, Deposit, Disc, Net Dlvd Price, Qty, Ext Cost):
+- "Net Dlvd Price" = cost per case (AFTER discounts). USE THIS for case_cost.
+- Do NOT use the "Price" column (that is BEFORE discounts).
+- "Qty" = number of cases ordered. If Qty > 1, Ext Cost = Net Dlvd Price * Qty. Use Net Dlvd Price (per single case) as case_cost.
+- Units per case are embedded in the description: "8/2L" = 8 bottles, "24/24oz" = 24 cans, "12/16oz" = 12 cans.
+- The first number before the "/" is units per case.
 
-CLUES TO LOOK FOR in descriptions:
-- Numbers like "24", "18", "12" often indicate total individual items in the case.
-- Suffixes like "6P", "6PK", "12P", "12PK", "4PK" indicate multi-pack retail units.
-- If a case has 24 items and they are sold as 6-packs, that is 24/6 = 4 retail units.
-- If a case has 18 items and no pack suffix, that is 18 individual retail units.
-- "LSE" or "LOOSE" = individual/loose items.
-- Letters like "C" or "B" before a number often mean cans or bottles (C24 = 24 cans, B12 = 12 bottles).
-- Words like "SINGLE", "EA", "EACH" = individual items.
-- If the invoice has a "Units" or "Qty" column separate from "Cases", that may indicate items per case.
-- Some invoices list a unit price AND a case price. Use the total/extended price for case_cost.
-- If "Cases" or "Qty Ordered" is greater than 1, the AMOUNT is for ALL cases combined. Divide by the number of cases to get cost per single case.
+FORMAT B - "Bakery style" (UPC, Description, Total Units, Net Price, Ext Amount):
+- "Total Units" = total individual items ordered (the quantity).
+- "Net Price" = cost per single item (e.g. $1.75 per pastry).
+- "Ext Amount" = Total Units * Net Price = total cost for that line.
+- case_cost = Ext Amount. units_per_case = Total Units. Each unit is one individual item.
 
-When in doubt about units_per_case, look at the total cost and think about whether the implied per-unit price makes sense for a convenience store. A single can of beer should cost $1-4, a 6-pack $6-12, a 12-pack $10-20. If your math gives $47 for a single can, something is wrong.
+FORMAT C - "Bimbo / bread distributor style" (UPC, Item No, Description, QTY, Sugg Retail, Retail Amount, Wholesale Price, Wholesale Amount):
+- "QTY" = total number of retail units delivered. This is units_per_case.
+- "Wholesale Price" = cost per single retail unit.
+- "Wholesale Amount" = QTY * Wholesale Price = total cost. This is case_cost.
+- IGNORE "Sugg Retail" and "Retail Amount" columns entirely.
 
-STEP 3 - BUILD CLEAN OUTPUT:
-For each line item return:
-- product: a CLEAN human-readable name. Translate any codes into plain English.
-  Good: "Coors Light 12oz (18 singles)", "Corona Extra 12oz 6-pack", "Doritos Nacho 1oz"
-  Bad: "COORS LIGHT C18 12OZ", "CORONA EXTRA B24 12OZ 6P"
-- case_cost: total cost for that line from the invoice
-- units_per_case: number of retail sellable units in the case
-- retail_unit: what one sellable unit is (e.g. "single can", "single bottle", "6-pack", "12-pack", "bag", "each")
-- upc: the UPC/barcode if visible (empty string if not)
+PACK CODE DECODER (critical -- read this carefully):
+- "SS2P" or "2P" = each retail unit is a 2-pack. retail_unit = "2-pack"
+- "SS4P" or "4P" = each retail unit is a 4-pack. retail_unit = "4-pack"
+- "FS6P" or "6P" = each retail unit is a 6-pack. retail_unit = "6-pack"
+- "FS FC" or "FC" with NO pack number = individual full-size item. retail_unit = "each"
+- "BX" = box. retail_unit = "box"
 
-Also extract from the invoice header:
-- distributor: the distributor/vendor name
-- invoice_date: date in YYYY-MM-DD format if visible (null if not)
-- total: invoice total if visible (null if not)
+WORKED EXAMPLES from a real Bimbo invoice:
+- "BIM CUERNITO SS2P FC" QTY=40, WholesalePrice=1.51, WholesaleAmt=60.40
+  -> product="Bimbo Cuernito 2-pack", qty_cases=40, net_per_case=1.51, units_in_case=1, retail_unit="2-pack"
+- "BIM ROLE CAN FS6P FC" QTY=8, WholesalePrice=3.02, WholesaleAmt=24.16
+  -> product="Bimbo Roles Canela 6-pack", qty_cases=8, net_per_case=3.02, units_in_case=1, retail_unit="6-pack"
+- "BIM CONCHAS SS2P FC" QTY=16, WholesalePrice=1.51, WholesaleAmt=24.16
+  -> product="Bimbo Conchas 2-pack", qty_cases=16, net_per_case=1.51, units_in_case=1, retail_unit="2-pack"
+- "BIM PANQUE NUE FS FC" QTY=2, WholesalePrice=2.41, WholesaleAmt=4.82
+  -> product="Bimbo Panque Nuez Full Size", qty_cases=2, net_per_case=2.41, units_in_case=1, retail_unit="each"
+- "MLA GANSITO SS2P BX" QTY=8, WholesalePrice=1.51, WholesaleAmt=12.08
+  -> product="Marinela Gansito 2-pack Box", qty_cases=8, net_per_case=1.51, units_in_case=1, retail_unit="2-pack"
+- "BIM HRSH MIN CROSS6P" QTY=12, WholesalePrice=1.51, WholesaleAmt=18.12
+  -> product="Bimbo Hershey Mini Croissant 6-pack", qty_cases=12, net_per_case=1.51, units_in_case=1, retail_unit="6-pack"
+- "MLA" prefix = Marinela brand. "BIM" prefix = Bimbo brand. "BAR TAK" = Barcel Takis.
+- CROSS-CHECK: For every line, verify that Wholesale Amount / Wholesale Price = QTY. If your QTY reading doesn't match this math, trust the math. Example: if amount=60.40 and price=1.51, then QTY must be 40 (60.40/1.51=40), not 8.
 
-Return ONLY valid JSON. No markdown fences, no explanation, no commentary:
+FORMAT D - Other/Unknown:
+- Find the column that represents the TOTAL COST for each line (usually rightmost dollar column, often labeled "Ext", "Amount", "Total", or "Ext Cost").
+- Find the per-unit or per-case cost column if separate.
+- If there is a quantity/cases column, and amount = price * qty, then case_cost = amount / qty for one case.
+
+FORMAT E - "Coca-Cola / Pepsi / major beverage distributor style" (DESCRIPTION, MAT#, QTY, PRICE, CON#, RATE, NET, EXTENDED):
+
+CRITICAL: This format has TWO types of lines. You MUST tell them apart or you will get WRONG numbers.
+
+TYPE 1 - CATEGORY HEADER (DO NOT OUTPUT AS AN ITEM):
+These are SHORT lines that name a product category. They look like:
+  "SPARKLIN 160Z 1-Ls 24"
+  "           6/144                    177.96"
+  "ENERGY D 160Z 1-Ls 24"
+  "           8/192                    398.64"
+HOW TO RECOGNIZE: No MAT# (6-digit number), no QTY/PRICE/RATE/NET columns. Just a product type, size, pack info, a fraction like "X/Y", and a dollar subtotal on the right.
+- "1-Ls 12" = each case has 12 loose items. "1-Ls 24" = 24 loose items per case.
+- "15-Pk 30" = retail unit is 15-pack, 30 cans per case = 2 fifteen-packs per case.
+- "X/Y" (e.g. "6/144") = total cases / total units across all flavors below.
+- The dollar amount (177.96) is a SUBTOTAL for the entire category. SKIP IT. NEVER use it as a case_cost.
+
+TYPE 2 - PRODUCT LINE (OUTPUT EACH ONE AS AN ITEM):
+These are LONG lines with many columns of numbers. They look like:
+  "16ZCAN24LS SPRITE    144089  1  34.25 ZDCS  -4.59  29.66    29.66"
+  "049000053432         24"
+HOW TO RECOGNIZE: Has a 6-digit MAT# (like 144089, 145278, 133115), followed by QTY, PRICE, contract code (ZDCS), RATE, NET, EXTENDED. The next line has a UPC and unit count.
+
+EVERY product line is a SEPARATE item. The category header above it just tells you what type of product it is and how many units per case.
+
+COLUMN RULES FOR PRODUCT LINES:
+- QTY = number of cases ordered (1, 2, 3, etc.)
+- PRICE = cost per case BEFORE discount (ignore this)
+- RATE = discount amount (negative number)
+- NET = cost per case AFTER discount. This is the real cost per case.
+- EXTENDED = QTY * NET = total cost for this flavor.
+- case_cost = EXTENDED
+- units_per_case = QTY * (units per case from the category header above)
+  Example: category says "1-Ls 24", product line has QTY=2. units_per_case = 2 * 24 = 48.
+- If category says "15-Pk 30": each case has 30/15=2 fifteen-packs. QTY=3 means 3*2=6 fifteen-packs. retail_unit="15-pack".
+- If category says "1-Ls": retail_unit = "single can" or "single bottle" (CAN vs PET in description).
+
+CROSS-CHECK: EXTENDED must equal QTY * NET. If EXTENDED seems too large (like 177.96 when QTY=1 and NET=29.66), you grabbed the category subtotal by mistake. Go back and find the real EXTENDED for that product line.
+
+DESCRIPTION CODE DECODER for product names:
+- Product line codes: "VW" = Vitaminwater, "DT" = Diet, "ZRO" = Zero Sugar, "SGR" = Sugar
+- "PET" = plastic bottle, "CAN" = aluminum can, "BIB" = bag-in-box syrup
+- "SPARKLIN" category = sodas and carbonated drinks (Coke, Sprite, Dr Pepper, Fanta)
+- "ENERGY D" category = Monster, Reign, Bang, NOS
+- "ENHNCD W" category = Vitaminwater, Smartwater
+- "ADVANCED" category = Bodyarmor
+- "DAIRY BE" category = Fairlife, Core Power
+- "JUICE DR" category = Minute Maid, Simply, Hi-C
+- Do NOT call Coca-Cola products "Pepsi"
+- Read the actual flavor/brand name from the product line, not just the category header
+
+WORKED EXAMPLES:
+- Category header: "ENHNCD W 200Z 1-Ls 12   3/36   66.69"  <-- 66.69 is SUBTOTAL, skip it
+  Product line 1: "20PETI2LS VW XXX  156089  1  26.20 ZDCS  -3.97  22.23  22.23"
+  -> product="Vitaminwater XXX 20oz", qty_cases=1, net_per_case=22.23, units_in_case=12, retail_unit="single bottle"
+  Product line 2: "20ZPET12LS VW PWR C  156030  1  26.20 ZDCS  -3.97  22.23  22.23"
+  -> product="Vitaminwater Power-C 20oz", qty_cases=1, net_per_case=22.23, units_in_case=12, retail_unit="single bottle"
+
+- Category header: "SPARKLIN 160Z 1-Ls 24   6/144   177.96"  <-- SKIP 177.96
+  Product line: "16ZCAN24LS SPRITE  144089  1  34.25 ZDCS  -4.59  29.66  29.66"
+  -> product="Sprite 16oz", qty_cases=1, net_per_case=29.66, units_in_case=24, retail_unit="single can"
+
+- Category header: "SPARKLIN 120Z 15-Pk 30   10/20   169.80"  <-- SKIP 169.80
+  Product line: "12ZCAN15PX2 COKE  133115  3  18.19 ZDCS  -1.21  16.98  50.94"
+  -> product="Coca-Cola 12oz 15-Pack", qty_cases=3, net_per_case=16.98, units_in_case=2, retail_unit="15-pack"
+  (units_in_case=2 because each case has 30 cans / 15 per pack = 2 fifteen-packs per case)
+
+=== STEP 2: DETERMINE RETAIL UNITS ===
+
+For each line, figure out what a customer picks up at the register:
+- Pack codes: "6P"/"6PK" = 6-pack, "12P"/"12PK" = 12-pack, "4PK" = 4-pack, "SS2P"/"2P" = 2-pack
+- If "24/24oz PET" the first number (24) is units per case, each is a single 24oz bottle
+- If no pack code, the unit is usually a single item (can, bottle, bag, bar, pastry, loaf)
+- "LSE"/"LOOSE" = individual items
+- Bakery items (bread, cake, muffins, croissants, conchas) are typically sold individually
+
+=== STEP 3: SANITY CHECK YOUR NUMBERS ===
+
+BEFORE outputting, verify each line:
+- unit_cost = case_cost / units_per_case
+- A single drink (can/bottle) should cost the store $0.30 to $3.00. If you get $15+ for a single can, your units_per_case is wrong.
+- A single pastry/bread item should cost $1.00 to $4.00.
+- A 6-pack should cost $4 to $10. A 12-pack $8 to $18.
+- If case_cost is very high (e.g. $60) and you have units_per_case=1, that is almost certainly wrong.
+
+=== STEP 4: OUTPUT ===
+
+For each item return:
+- product: CLEAN human-readable name. Expand abbreviations. Include size.
+  Good: "Faygo Grape 2L", "Blueberry Cream Cheese Danish", "Bimbo Cuernito 2-pack"
+  Bad: "FAY Grape 8/2L", "BLUEBERRY CREAM", "BIM CUERNITO SS2P FC"
+- qty_cases: number of cases/units ordered on this line (the QTY column). For most invoices this is 1. For Coca-Cola style, read the QTY column directly from the product line.
+- net_per_case: cost per single case AFTER discounts. For DET style = Net Dlvd Price. For Coca-Cola style = NET column. For bakery = Net Price. For Bimbo = Wholesale Price. If there is no discount, this equals the unit price.
+- units_in_case: how many sellable retail units are in ONE case (not total across all cases). For DET: the first number in the description (e.g. "24/24oz" = 24). For Coca-Cola: from category header (e.g. "1-Ls 24" = 24). For bakery/Bimbo: this equals 1 if qty_cases represents individual items.
+- retail_unit: what one unit is ("each", "single can", "single bottle", "2-pack", "6-pack", "loaf", etc.)
+- upc: UPC/barcode if visible (empty string if not)
+
+IMPORTANT: Do NOT calculate case_cost yourself. Just give me qty_cases, net_per_case, and units_in_case and I will calculate the totals. This avoids accidentally using category subtotals.
+
+Header info:
+- distributor: vendor/distributor name from the invoice header
+- invoice_date: in YYYY-MM-DD format (null if not visible)
+- total: invoice grand total if visible (null if not)
+
+Return ONLY valid JSON, no markdown fences, no explanation:
 {
   "distributor": "...",
   "invoice_date": "YYYY-MM-DD or null",
   "total": 0.00,
   "items": [
-    {"product": "...", "case_cost": 0.00, "units_per_case": 1, "retail_unit": "each", "upc": ""}
+    {"product": "...", "qty_cases": 1, "net_per_case": 0.00, "units_in_case": 1, "retail_unit": "each", "upc": ""}
   ]
 }"""
 
 
 def enhance_invoice_image(image_bytes: bytes) -> bytes:
     """Sharpen, boost contrast, and auto-orient an invoice photo.
-    This is similar to what apps like Fetch do to handle shaky photos.
+    Optimized for OCR accuracy on small dot-matrix receipt text.
     """
     img = Image.open(io.BytesIO(image_bytes))
 
@@ -213,76 +324,149 @@ def enhance_invoice_image(image_bytes: bytes) -> bytes:
     except (AttributeError, KeyError, TypeError):
         pass
 
-    # Resize if too large (keeps API costs down, speeds up processing)
+    # Resize -- 2048 gives better accuracy on small text (worth the extra tokens)
     max_dim = 2048
     if max(img.size) > max_dim:
         ratio = max_dim / max(img.size)
         new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
         img = img.resize(new_size, Image.LANCZOS)
 
-    # Sharpen to reduce blur from shaky hands
-    img = img.filter(ImageFilter.SHARPEN)
-    img = img.filter(ImageFilter.SHARPEN)
+    # Convert to grayscale -- removes color noise, makes text pop for OCR
+    img = img.convert("L")
 
-    # Boost contrast so faded text pops
+    # UnsharpMask is much better than basic SHARPEN for making small text crisp
+    # radius=2: targets fine text detail, percent=150: strong sharpening,
+    # threshold=3: only sharpens edges (not noise)
+    img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+
+    # High contrast to separate text from background
     enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(1.4)
+    img = enhancer.enhance(1.6)
 
     # Slight brightness bump for dark photos
     enhancer = ImageEnhance.Brightness(img)
     img = enhancer.enhance(1.1)
 
-    # Convert to RGB if needed (handles RGBA/palette images)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+    # Convert back to RGB for JPEG encoding
+    img = img.convert("RGB")
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     return buf.getvalue()
 
 
-def parse_invoice_image(image_bytes: bytes) -> dict:
-    """Enhance the image, send to GPT-4 Vision, and get structured items."""
-    # Enhance before sending to AI
+def _parse_single_image(client, image_bytes: bytes) -> dict:
+    """Parse a single invoice page image with Claude."""
     enhanced = enhance_invoice_image(image_bytes)
-
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     b64 = base64.b64encode(enhanced).decode("utf-8")
 
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": INVOICE_PARSE_PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{b64}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            }
-        ],
-        max_tokens=4096,
-        temperature=0.1,
+    content = [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": b64,
+            },
+        },
+        {"type": "text", "text": INVOICE_PARSE_PROMPT},
+    ]
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8192,
+        messages=[{"role": "user", "content": content}],
     )
 
-    raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if the model wraps the JSON
+    raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1]
         raw = raw.rsplit("```", 1)[0]
 
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
+    return json.loads(raw)
+
+
+def parse_invoice_images(image_bytes_list: list) -> dict:
+    """Parse invoice images. Uses per-page processing with parallel threads
+    for better accuracy on dense invoices (each page gets full AI attention).
+    Results are merged and deduplicated.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    if len(image_bytes_list) == 1:
+        # Single page: simple direct call
+        try:
+            return _parse_single_image(client, image_bytes_list[0])
+        except (json.JSONDecodeError, KeyError):
+            raise ValueError(
+                "Could not read this invoice clearly. "
+                "Try taking another photo with better lighting and hold steady."
+            )
+
+    # Multiple pages: process in parallel for speed + accuracy
+    results = [None] * len(image_bytes_list)
+    errors = []
+
+    def process_page(idx, img_bytes):
+        return idx, _parse_single_image(client, img_bytes)
+
+    with ThreadPoolExecutor(max_workers=min(len(image_bytes_list), 4)) as executor:
+        futures = {
+            executor.submit(process_page, i, img): i
+            for i, img in enumerate(image_bytes_list)
+        }
+        for future in as_completed(futures):
+            try:
+                idx, parsed = future.result()
+                results[idx] = parsed
+            except Exception as e:
+                errors.append(str(e))
+
+    if all(r is None for r in results):
         raise ValueError(
             "Could not read this invoice clearly. "
             "Try taking another photo with better lighting and hold steady."
         )
+
+    # Merge results from all pages
+    distributor = "Unknown"
+    invoice_date = None
+    total = None
+    all_items = []
+
+    for parsed in results:
+        if parsed is None:
+            continue
+        if parsed.get("distributor") and distributor == "Unknown":
+            distributor = parsed["distributor"]
+        if parsed.get("invoice_date") and not invoice_date:
+            invoice_date = parsed["invoice_date"]
+        if parsed.get("total"):
+            # Take the largest total (likely the real invoice total)
+            page_total = float(parsed["total"])
+            if total is None or page_total > total:
+                total = page_total
+        all_items.extend(parsed.get("items", []))
+
+    # Deduplicate by product name (overlapping pages)
+    seen = {}
+    unique_items = []
+    for item in all_items:
+        name_key = item.get("product", "").strip().lower()
+        upc_key = item.get("upc", "").strip()
+        dedup_key = f"{name_key}|{upc_key}" if upc_key else name_key
+        if dedup_key not in seen:
+            seen[dedup_key] = True
+            unique_items.append(item)
+
+    return {
+        "distributor": distributor,
+        "invoice_date": invoice_date,
+        "total": total,
+        "items": unique_items,
+    }
 
 
 def calculate_retail_price(unit_cost: float, margin_pct: float) -> float:
@@ -387,11 +571,8 @@ def scan_invoice():
     if not files:
         return jsonify({"error": "No image files provided"}), 400
 
-    # Parse each photo and merge results
-    all_items = []
-    distributor = "Unknown"
-    invoice_date_str = None
-    invoice_total = 0.0
+    # Read all images and save originals
+    image_bytes_list = []
     saved_filenames = []
 
     for idx, file in enumerate(files):
@@ -405,29 +586,23 @@ def scan_invoice():
         with open(filepath, "wb") as f:
             f.write(image_bytes)
         saved_filenames.append(filename)
+        image_bytes_list.append(image_bytes)
 
-        try:
-            parsed = parse_invoice_image(image_bytes)
-        except Exception as e:
-            return jsonify({
-                "error": f"Could not read page {idx + 1}: {str(e)}"
-            }), 500
+    # Send ALL images to GPT-4o in a single call (much faster than per-image)
+    try:
+        parsed = parse_invoice_images(image_bytes_list)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        # Take distributor and date from whichever page has them
-        if parsed.get("distributor") and distributor == "Unknown":
-            distributor = parsed["distributor"]
-        if parsed.get("invoice_date") and not invoice_date_str:
-            invoice_date_str = parsed["invoice_date"]
-        if parsed.get("total"):
-            invoice_total = max(invoice_total, float(parsed["total"]))
-
-        all_items.extend(parsed.get("items", []))
+    distributor = parsed.get("distributor", "Unknown") or "Unknown"
+    invoice_date_str = parsed.get("invoice_date")
+    invoice_total = float(parsed.get("total") or 0)
+    all_items = parsed.get("items", [])
 
     # Deduplicate items by product name + UPC (same item from overlapping photos)
     seen = {}
     unique_items = []
     for item in all_items:
-        # Build a dedup key from product name (normalized) and UPC
         name_key = item.get("product", "").strip().lower()
         upc_key = item.get("upc", "").strip()
         dedup_key = f"{name_key}|{upc_key}" if upc_key else name_key
@@ -474,9 +649,24 @@ def scan_invoice():
     # Create line items
     items_out = []
     for item in unique_items:
-        case_cost = float(item.get("case_cost", 0))
-        units = int(item.get("units_per_case", 1)) or 1
-        unit_cost = round(case_cost / units, 4)
+        # Calculate case_cost from components (avoids category subtotal errors)
+        # New format: qty_cases, net_per_case, units_in_case
+        # Fallback: case_cost, units_per_case (old format)
+        qty_cases = int(item.get("qty_cases", 1)) or 1
+        net_per_case = item.get("net_per_case")
+        units_in_case = int(item.get("units_in_case", 1)) or 1
+
+        if net_per_case is not None:
+            # New format: calculate case_cost ourselves
+            net_per_case = float(net_per_case)
+            case_cost = round(qty_cases * net_per_case, 2)
+            units = qty_cases * units_in_case
+        else:
+            # Fallback to old format
+            case_cost = float(item.get("case_cost", 0))
+            units = int(item.get("units_per_case", 1)) or 1
+
+        unit_cost = round(case_cost / units, 4) if units > 0 else 0
         retail = calculate_retail_price(unit_cost, margin)
 
         inv_item = InvoiceItem(
