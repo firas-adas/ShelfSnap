@@ -1,12 +1,12 @@
 # ShelfSnap
 
-Scan wholesale invoices with AI, calculate retail prices at your margin, and print shelf labels. Built for gas station and convenience store owners.
+Scan wholesale invoices with AI, calculate retail prices at your margin, and print shelf labels. Built for gas station and convenience store owners — in real use by multiple independent store owners today.
 
 ## Tech stack
 
 - **Backend:** Python, Flask, SQLAlchemy, PostgreSQL (SQLite for dev)
 - **Frontend:** React, Vite, React Router, Lucide Icons
-- **AI:** OpenAI GPT-4o Vision for invoice OCR and structured extraction
+- **AI:** Claude (claude-sonnet-4) for invoice OCR and structured extraction, with distributor-specific prompt formatting and parallel per-page processing
 - **Labels:** ReportLab PDF generation (Avery 5160 format)
 
 ## Quick start
@@ -15,7 +15,6 @@ Scan wholesale invoices with AI, calculate retail prices at your margin, and pri
 
 ```bash
 cd backend
-
 # Create virtual environment
 python3 -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
@@ -25,7 +24,7 @@ pip install -r requirements.txt
 
 # Set up environment variables
 cp .env.example .env
-# Edit .env and add your OpenAI API key
+# Edit .env and add your Anthropic API key
 
 # Run the server
 python app.py
@@ -37,7 +36,6 @@ Backend runs at `http://localhost:5000`
 
 ```bash
 cd frontend
-
 # Install dependencies
 npm install
 
@@ -51,7 +49,7 @@ Frontend runs at `http://localhost:5173` with API proxy to backend.
 
 | Variable | Description |
 |---|---|
-| `OPENAI_API_KEY` | Your OpenAI API key (needs GPT-4o access) |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key (Claude access) |
 | `JWT_SECRET` | Random secret for JWT tokens |
 | `DATABASE_URL` | Database connection string (defaults to SQLite) |
 
@@ -108,16 +106,25 @@ Five tables: `users`, `invoices`, `invoice_items`, `products`, `price_history`. 
 ## How it works
 
 1. Owner snaps a photo of their wholesale invoice
-2. Image is sent to GPT-4o Vision with a structured extraction prompt
-3. AI returns product names, case costs, and units per case as JSON
+2. Pages are processed in parallel and sent to Claude with a distributor-specific extraction prompt (Coca-Cola, Bimbo, Home Juice, Bon Appetit, and others each have their own prompt formatting to handle differences in invoice layout)
+3. AI returns structured line items as JSON (`qty_cases`, `net_per_case`, `units_in_case`)
 4. Backend calculates unit cost and retail price at the owner's margin %
 5. Owner reviews, edits any mistakes, selects items
 6. Backend generates a PDF of Avery 5160 shelf labels
 7. Products and prices are cataloged for cost tracking over time
 
+## Known limitations
+
+- Coca-Cola invoices occasionally bleed category subtotals into line-item extraction — being actively worked on
+- Item matching across distributors is currently manual; no cross-distributor SKU crosswalk yet
+
 ## Deployment
 
 For production, swap SQLite for PostgreSQL via the `DATABASE_URL` env var. Deploy the Flask backend on Render/Railway/Fly.io with gunicorn. Build the React frontend with `npm run build` and serve the `dist/` folder from the same server or a CDN.
+
+## Roadmap
+
+Currently building out the data layer: landing raw invoice extractions before parsing, modeling cost history over time, and reconciling invoices against distributor order data (starting with H.T. Hackney) to catch cost increases and billing errors automatically.
 
 ## Monetization
 
